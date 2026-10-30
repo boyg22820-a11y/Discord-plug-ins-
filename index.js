@@ -1,6 +1,6 @@
 (() => {
   "use strict";
-  const VERSION = "0.1.0";
+  const VERSION = "0.1.1";
   const COLS = [3, 4, 5, 6];
   const SORTS = ["newest", "oldest", "filename"];
   const unpatches = [];
@@ -206,8 +206,106 @@
     );
   }
 
+
+  // Inspect only metadata of already initialized modules. Never require modules,
+  // invoke exported methods, evaluate getters, or include property values.
+  let diagnosticReport = "Open a chat, tap + and Photos, then return here and tap Scan loaded modules.";
+  let scanGeneration = 0;
+  let scanning = false;
+  const relevantName = /camera.?roll|photo|gallery|(?:media|image|asset|attachment).*(?:picker|library)|(?:picker|library).*(?:media|image|asset|attachment)|^getAssets$|^getAlbums$|^handleSelectKeyboardItem$/i;
+  const identifier = /^[A-Za-z_$][A-Za-z0-9_$]{0,95}$/;
+  const ownValue = (object, key) => {
+    if (!object || (typeof object !== "object" && typeof object !== "function")) return undefined;
+    try { const d = Object.getOwnPropertyDescriptor(object, key); return d && d.value; }
+    catch (_) { return undefined; }
+  };
+  const ownNames = object => {
+    try { return Object.getOwnPropertyNames(object).filter(k => identifier.test(k)); }
+    catch (_) { return []; }
+  };
+  function metadata(object) {
+    if (!object || (typeof object !== "object" && typeof object !== "function")) return [];
+    const hits = ownNames(object).filter(k => relevantName.test(k));
+    for (const key of ["name", "displayName"]) {
+      const name = ownValue(object, key);
+      if (typeof name === "string" && identifier.test(name) && relevantName.test(name)) hits.push(name);
+    }
+    // React.memo / forwardRef wrappers, without traversing props or state.
+    for (const key of ["render", "type"]) {
+      const fn = ownValue(object, key);
+      const name = ownValue(fn, "displayName") || ownValue(fn, "name");
+      if (typeof name === "string" && identifier.test(name) && relevantName.test(name)) hits.push(name);
+    }
+    return Array.from(new Set(hits)).sort().slice(0, 16);
+  }
+  function diagnosticVersions() {
+    const info = safeFind(() => vendetta.debug.getDebugInfo());
+    const cleanVersion = v => typeof v === "string" || typeof v === "number"
+      ? String(v).replace(/[^A-Za-z0-9 ._()+-]/g, "").slice(0, 80) : "unknown";
+    return [
+      `Plugin: ${VERSION}`,
+      `Kettu: ${cleanVersion(info && info.bunny && info.bunny.version)}`,
+      `Discord: ${cleanVersion(info && info.discord && info.discord.version)}`,
+      `React Native: ${cleanVersion(info && info.react && info.react.nativeVersion)}`
+    ];
+  }
+  async function scanLoadedModules() {
+    if (scanning) return diagnosticReport;
+    scanning = true;
+    const generation = ++scanGeneration;
+    const rows = diagnosticVersions();
+    const modules = metro.modules;
+    let loaded = 0, matched = 0, shown = 0;
+    try {
+      if (!modules || typeof modules !== "object") {
+        rows.push("Loaded module registry unavailable on this client.");
+      } else {
+        const ids = Object.keys(modules).filter(id => /^\d+$/.test(id));
+        for (let offset = 0; offset < ids.length; offset += 150) {
+          if (generation !== scanGeneration) return diagnosticReport;
+          for (const id of ids.slice(offset, offset + 150)) {
+            const record = ownValue(modules, id);
+            if (ownValue(record, "isInitialized") !== true || ownValue(record, "hasError")) continue;
+            loaded++;
+            const exports = ownValue(ownValue(record, "publicModule"), "exports");
+            const hits = metadata(exports).concat(metadata(ownValue(exports, "default")));
+            // Named exports may contain memoized or named picker components.
+            for (const key of ownNames(exports).slice(0, 300)) {
+              const child = ownValue(exports, key);
+              if (typeof child === "function" || (child && typeof child === "object" && ownValue(child, "$$typeof"))) {
+                hits.push(...metadata(child));
+              }
+            }
+            if (hits.length) {
+              matched++;
+              if (shown++ < 120) rows.push(`Module ${id}: ${Array.from(new Set(hits)).slice(0, 16).join(", ")}`);
+            }
+          }
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
+        rows.push(`Initialized modules: ${loaded}; matching modules: ${matched}; shown: ${Math.min(shown, 120)}`);
+      }
+      // List native module identifiers only. Never read module getters or invoke
+      // native/turbo module lookup functions based on guessed module names.
+      const native = RN.NativeModules;
+      if (native) rows.push("Native names: " + ownNames(native).filter(k => relevantName.test(k)).slice(0, 60).join(", "));
+      rows.push("Metadata only. No photos, filenames, paths, messages, account IDs, or tokens are collected. No automatic upload.");
+      if (generation === scanGeneration) diagnosticReport = rows.join("\n");
+    } catch (_) {
+      if (generation === scanGeneration) diagnosticReport = rows.concat("Scan could not finish on this client.").join("\n");
+    } finally {
+      if (generation === scanGeneration) scanning = false;
+    }
+    return diagnosticReport;
+  }
+
   function Settings() {
     const [refresh, setRefresh] = React.useState(0);
+    const [report, setReport] = React.useState(diagnosticReport);
+    const [busy, setBusy] = React.useState(false);
+    const [copyStatus, setCopyStatus] = React.useState("");
+    const mounted = React.useRef(true);
+    React.useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
     function change(key, val) { storage[key] = val; setRefresh(n => n + 1); }
     return E(RN.ScrollView, { style: { flex: 1, backgroundColor: "#232428" },
       contentContainerStyle: { padding: 16, paddingBottom: 50 } },
@@ -215,7 +313,25 @@
       txt("Status: " + runtime, { color: "#b6bbc6", marginBottom: 10 }),
       txt("Replaces Discord's Attach File action with an in-Discord gallery when the CameraRoll bridge and custom alert are available. If unavailable, normal Discord behavior remains.",
         { color: "#b6bbc6", marginBottom: 10 }),
-      heading("Custom gallery"),
+      heading("Photos tray investigation"),
+      txt("This update diagnoses the built-in + → Photos tray. It does not resize or sort that tray yet. Open it once before scanning. The controls below apply only to the older experimental Files gallery.", { color: "#ffdb99", marginBottom: 10 }),
+      button(busy ? "Scanning…" : "Scan loaded modules", async () => {
+        if (busy) return;
+        setBusy(true);
+        try { const result = await scanLoadedModules(); if (mounted.current) setReport(result); }
+        finally { if (mounted.current) setBusy(false); }
+      }, false),
+      button("Copy diagnostic report", () => {
+        try {
+          const clipboard = metro.common.clipboard;
+          if (!clipboard || typeof clipboard.setString !== "function") throw new Error();
+          clipboard.setString(report);
+          setCopyStatus("Copied. Paste the report into this ChatGPT conversation.");
+        } catch (_) { setCopyStatus("Copy unavailable. Select the report text or take screenshots."); }
+      }, false),
+      txt(copyStatus, { color: "#b6bbc6", marginVertical: 5 }),
+      E(RN.Text, { selectable: true, style: { color: "#d3d6df", fontSize: 12, marginVertical: 10 } }, report),
+      heading("Experimental Files gallery"),
       button(storage.enabled ? "Enabled (tap to disable)" : "Disabled (tap to enable)",
         () => change("enabled", !storage.enabled), !!storage.enabled),
       heading("Photo columns"),
@@ -265,6 +381,8 @@
       }
     },
     onUnload() {
+      scanGeneration++;
+      scanning = false;
       while (unpatches.length) { try { unpatches.pop()(); } catch (_) {} }
       active = false;
       runtime = "Unloaded";

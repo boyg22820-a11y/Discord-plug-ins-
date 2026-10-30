@@ -1,4 +1,19 @@
-# BetterMediaPicker (Kettu prototype v0.1.0)
+# BetterMediaPicker (Kettu prototype v0.1.1)
+
+## v0.1.1: Photos tray diagnostics
+
+The built-in **+ → Photos** tray is **not modified** by this version. Version 0.1.0 failed to locate `getPhotos` on the reported Discord 351.11 build. This proves that lookup failed, not that native photo access is impossible.
+
+This update adds **Scan loaded modules** and **Copy diagnostic report** to plugin settings. To investigate the tray:
+
+1. Update the plugin and reload Kettu. Confirm **0.1.1** in this plugin's settings.
+2. Open a chat, tap **+**, and open the **Photos** tray once.
+3. Return to this plugin's settings and tap **Scan loaded modules**.
+4. Tap **Copy diagnostic report** and paste into the ChatGPT conversation where this plugin is being developed.
+
+The scan reads metadata from already initialized Metro modules and lists relevant native module identifiers. It does not force-load modules, call photo APIs, evaluate export getters, read photo contents, or include property values such as filenames, file paths, message text or credentials. Nothing is uploaded automatically. Reports are kept in memory until plugin unload; the copy button writes the report to the clipboard. Names may be stripped from production code, so a report may still be insufficient to locate the tray.
+
+The older Files gallery below remains experimental. Its column/sorting settings apply only to that custom gallery if the required interfaces are detected, and do not affect the built-in Photos tray.
 
 A **real, experimental classic Vendetta-family plugin**. Targets Kettu's Discord Android **Attach File** action. It aims to open a photo grid *inside Discord* with persistent settings: 3, 4, 5, or 6 columns; sorting among loaded photos; and instant single-tap attachment or multi-selection.
 

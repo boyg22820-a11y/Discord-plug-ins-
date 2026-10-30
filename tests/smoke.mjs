@@ -17,7 +17,7 @@ function makeTest(cameraAvailable=true, attachAvailable=true) {
     page_info: {has_next_page:false}
   }) } : null;
   const React = { createElement: (type, props, ...children) => ({type, props:props||{}, children}),
-    useState: initial => [initial, () => {}], useEffect: ()=>{}, Fragment:'Fragment' };
+    useState: initial => [initial, () => {}], useEffect: ()=>{}, useRef: value => ({current:value}), Fragment:'Fragment' };
   const RN = { Text:'Text', View:'View', TouchableOpacity:'Touch', Image:'Image', ScrollView:'ScrollView', FlatList:'FlatList', Dimensions:{get:()=>({width:440,height:920})} };
   const vendetta={
     plugin:{storage:{}}, logger:{log:()=>{}},
@@ -27,7 +27,7 @@ function makeTest(cameraAvailable=true, attachAvailable=true) {
     ui:{alerts:{showCustomAlert:(component)=>({component})}},
     patcher:{ instead:(name,obj,cb)=>{assert.equal(name,'handleAttachFile');assert.equal(obj,target); patched=cb; return ()=>{restored=true;};} }
   };
-  const plugin=vm.runInNewContext(`(function(vendetta){return ${code}\n})`,{vendetta, console})(vendetta);
+  const plugin=vm.runInNewContext(`(function(vendetta){return ${code}\n})`,{vendetta, console, setTimeout})(vendetta);
   return {plugin,vendetta,get patched(){return patched},get restored(){return restored},attachments,target};
 }
 assert.equal(manifest.main,'index.js');
@@ -48,3 +48,57 @@ assert.equal(s.restored,true);
 s=makeTest(false);s.plugin.onLoad();assert.equal(s.patched,null);s.plugin.onUnload();
 s=makeTest(true,false);s.plugin.onLoad();assert.equal(s.patched,null);s.plugin.onUnload();
 console.log('PASS: loader expression, plugin hooks, default settings, interception, disable fallback, missing API, cleanup.');
+
+
+// Runtime diagnostics must stay passive and exclude private property values.
+s=makeTest(false);
+let copied=''; let getterCalls=0;
+s.vendetta.metro.common.clipboard={setString:value=>{copied=value;}};
+s.vendetta.debug={getDebugInfo:()=>({bunny:{version:'test-kettu'},discord:{version:'351.11'},react:{nativeVersion:'test-rn'},device:{model:'PRIVATE_DEVICE'}})};
+const picker={MediaPicker: function MediaPicker(){}};
+Object.defineProperty(picker,'getPhotos',{enumerable:true,get(){getterCalls++;throw Error('Do not invoke');}});
+picker.secret='PRIVATE_TOKEN';
+s.vendetta.metro.modules={
+  1:{isInitialized:true,publicModule:{exports:picker}},
+  2:{isInitialized:false,publicModule:{exports:{PhotoPicker:()=>{}}}},
+  3:{isInitialized:true,publicModule:{exports:{default:function GalleryPicker(){}}}}
+};
+s.vendetta.metro.common.ReactNative.NativeModules={MediaLibrary:{privateURI:'file:///PRIVATE_PHOTO.jpg'}};
+s.plugin.onLoad();
+function buttons(tree,result=[]) {
+  if(!tree || typeof tree!=='object')return result;
+  if(tree.type==='Touch') result.push(tree);
+  for(const child of (tree.children||[]).flat(Infinity)) buttons(child,result);
+  return result;
+}
+let tree=s.plugin.settings();
+let scan=buttons(tree).find(b=>b.children[0].children[0]==='Scan loaded modules');
+let state=[];let cursor=0;
+s.vendetta.metro.common.React.useState=initial=>{
+ const i=cursor++;if(!(i in state))state[i]=initial;
+ return [state[i],value=>{state[i]=typeof value==='function'?value(state[i]):value;}];
+};
+cursor=0; tree=s.plugin.settings();
+await buttons(tree).find(b=>b.children[0].children[0]==='Scan loaded modules').props.onPress();
+cursor=0;tree=s.plugin.settings();
+buttons(tree).find(b=>b.children[0].children[0]==='Copy diagnostic report').props.onPress();
+assert.match(copied,/Module 1:.*MediaPicker/);
+assert.match(copied,/Module 3:.*GalleryPicker/);
+assert.doesNotMatch(copied,/Module 2:/);
+assert.doesNotMatch(copied,/PRIVATE_|file:\/\//);
+assert.equal(getterCalls,0);
+assert.equal(s.patched,null);
+// A module initialized after opening the tray must appear in the next scan.
+s.vendetta.metro.modules[2].isInitialized=true;
+cursor=0;tree=s.plugin.settings();
+await buttons(tree).find(b=>b.children[0].children[0]==='Scan loaded modules').props.onPress();
+cursor=0;tree=s.plugin.settings();
+buttons(tree).find(b=>b.children[0].children[0]==='Copy diagnostic report').props.onPress();
+assert.match(copied,/Module 2:.*PhotoPicker/);
+// Unload cancels in-flight scans, and preserves existing settings.
+s.vendetta.plugin.storage.columns=6;
+cursor=0;tree=s.plugin.settings();
+const pending=buttons(tree).find(b=>b.children[0].children[0]==='Scan loaded modules').props.onPress();
+s.plugin.onUnload();await pending;
+assert.equal(s.vendetta.plugin.storage.columns,6);
+console.log('PASS: diagnostics UI, metadata-only report, skipped getters, lazy module refresh, clipboard, unload cancellation.');
