@@ -1,0 +1,16 @@
+{
+  "name": "BetterMediaPicker Prototype",
+  "description": "Experimental in-Discord photo grid with 3-6 columns, local sorting, fast single-tap attach, and a native picker fallback. For Kettu and classic Vendetta-family clients.",
+  "authors": [
+    {
+      "name": "ChatGPT prototype",
+      "id": "0"
+    }
+  ],
+  "main": "index.js",
+  "vendetta": {
+    "icon": "ic_image"
+  },
+  "version": "0.1.0",
+  "hash": "43f496713c6aed8d24789411628494d5be0fcf6f206a77ba5e674987fa64665f"
+}
