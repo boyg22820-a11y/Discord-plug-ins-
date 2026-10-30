@@ -1,6 +1,6 @@
 {
   "name": "BetterMediaPicker Prototype",
-  "description": "Quick Photos: a custom in-app collection with adjustable columns, favorites, filename search and one-tap attachment. Add photos through Android\u2019s picker; private copies are saved where supported.",
+  "description": "Quick Media: folders, tags, ordered batches, photos/videos, per-chat browsing, bulk Undo, content hashes, storage/repair and portable backups. Discord integrations are capability-checked.",
   "authors": [
     {
       "name": "ChatGPT prototype",
@@ -11,6 +11,6 @@
   "vendetta": {
     "icon": "ic_image"
   },
-  "version": "0.2.0",
-  "hash": "0290fa0f03d2773301031b10b9648258eb99daae157b9c2e160a8abbf150b4f0"
+  "version": "0.3.0",
+  "hash": "40d78988fdb364956181f1e763f263e0d8d8fbac475853c9c379cce3c107c8e4"
 }

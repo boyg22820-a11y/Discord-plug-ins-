@@ -1,15 +1,16 @@
-# BetterMediaPicker setup
+# Kettu setup · Quick Media 0.3.0
 
-The repository is configured for GitHub Pages. Its published plugin folder is:
+Install/update this folder URL in Kettu's Plugins screen:
 
 `https://boyg22820-a11y.github.io/Discord-plug-ins-/BetterMediaPicker/`
 
-1. Install that folder URL through Kettu Settings → Plugins → +, or update the existing installation.
-2. Reload Kettu and confirm version **0.2.0** in BetterMediaPicker settings. Enable it.
-3. In a chat, open **+ → Files** (or Attach File), or run **/quickphotos**.
-4. Tap **Add photos**. Select a batch in Android's picker and confirm.
-5. Reuse those photos from Quick Photos. Tap adds to the composer; it never sends by itself.
+1. Reload Kettu, enable BetterMediaPicker, and confirm **0.3.0** in plugin settings.
+2. Try **+** in a chat. If the checked media-menu hook is unavailable, use **+ → Files / Attach File**, **/quickphotos**, or **Open Quick Media** in settings.
+3. Use **Collections** to create folders/batches. Use **Add media** to choose a destination/tags before selecting photos or videos in Android's picker.
+4. Select/attach items or attach an ordered batch. Review the composer and press Send yourself.
+5. Use **Discord menu**, or the settings **Normal Discord menu on next +** action, to access the original menu.
+6. Use Storage for repair, exact duplicate checking, and trash. Use Backup to save all required backup parts outside the app.
 
-Quick Photos is a collection of photos you add, not an automatic view of every photo on the device. Saved tiles use private local copies; Temporary tiles need re-adding after reload or cache expiry. Read README.md for storage behavior and limitations.
+Settings report installed client hooks. The new +/send-tracking/native sharing integrations are not yet verified on the user's phone. Read README.md for the exact capabilities and limits.
 
-The original **+ → Photos** tray remains available and unchanged. Additional plugins can be deployed as new subfolders under docs without creating another repository.
+GitHub Pages is published from main /docs. More plugins can be added in their own docs subfolders.
