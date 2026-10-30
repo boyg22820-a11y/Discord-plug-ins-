@@ -1,99 +1,55 @@
-# BetterMediaPicker (Kettu prototype v0.1.2)
+# BetterMediaPicker · Quick Photos 0.2.0
 
-## v0.1.2: Targeted Photos API capture
+A custom photo collection inside Kettu, built for fast reuse of photos you choose. This replaces the 0.1.x diagnostic builds. **It does not modify Discord's built-in Photos tray or automatically enumerate the phone's entire photo library.** It does not use `getPhotos` or `getDeviceMediaPhotos`.
 
-The user's 0.1.1 report identified `getDeviceMediaPhotos` on Kettu v1.4.3 / Discord 351.11 / React Native 0.86.0. Its calling contract and output are still unverified. This update can observe up to three real calls during a 60-second window. It does not invoke that API itself or change the Photos tray.
+## Using it
 
-1. Update and reload, then confirm **0.1.2** in plugin settings.
-2. Tap **Start Photos API capture (60 seconds)**.
-3. Immediately open a chat, tap **+ → Photos**, and scroll to load more images.
-4. Return to settings, tap **Refresh captured report**, then **Copy diagnostic report**, and paste into this ChatGPT conversation.
+1. Update/reload the existing plugin, enable it, and confirm **0.2.0** in settings.
+2. Open a chat, then **+ → Files**. The plugin replaces `handleAttachFile` with Quick Photos. Depending on the Discord build this action may be labelled Attach File.
+3. Alternatively, run **/quickphotos** in that chat. The command opens the picker and returns no message to send. Plugin settings also have an **Open Quick Photos** button for the active chat.
+4. Tap **Add photos**. Choose photos in Android's system picker and confirm your selection. This step is needed to add new photos; subsequent reuse happens in the custom collection.
+5. Tap a photo to attach it to the current composer. Review the message and press Send yourself.
 
-Capture preserves the original arguments, returned value/promise and thrown errors. Reports include only allowlisted field names, types and array lengths, with no scalar data values. Captures stay in memory, stop after 60 seconds, and are detached on unload. An unpatchable export or cached tray may produce no call; that is reported explicitly.
+## Controls
 
-## v0.1.1: Photos tray diagnostics
+- **3–6 columns:** fewer columns give larger previews.
+- **Recently added / Oldest added / Filename:** dates are the time added to Quick Photos, not original photo capture dates.
+- **Filename search**, **favorites filter**, and a star button on each photo. Holding a photo also toggles favorite.
+- **Tap to attach**, or **Multi-select** then Attach, with a limit of 10 per batch.
+- **Manage → Remove:** removes this collection entry and its private copy, if any. Original gallery photos are not deleted.
+- Imports are limited to 100 per batch; the collection is capped at 1,000 photos.
 
-The built-in **+ → Photos** tray is **not modified** by this version. Version 0.1.0 failed to locate `getPhotos` on the reported Discord 351.11 build. This proves that lookup failed, not that native photo access is impossible.
+## Private copies and temporary photos
 
-This update adds **Scan loaded modules** and **Copy diagnostic report** to plugin settings. To investigate the tray:
+When the client exposes Kettu's documented native file interface, the plugin reads selected local images and saves copies under `better-media-picker/photos/` in the app's private documents directory. The plugin stores only its own collection metadata and settings. Copies use device storage. They can survive ordinary app reloads, but clearing app data or uninstalling the app removes them.
 
-1. Update the plugin and reload Kettu. Confirm **0.1.1** in this plugin's settings.
-2. Open a chat, tap **+**, and open the **Photos** tray once.
-3. Return to this plugin's settings and tap **Scan loaded modules**.
-4. Tap **Copy diagnostic report** and paste into the ChatGPT conversation where this plugin is being developed.
+Photos with unknown file size, size over 20 MiB, or a copy failure remain **Temporary**. If the native file interface is unavailable, all imported photos are temporary. These references stay only in memory; re-add them after Kettu reloads or when the original picker cache expires. Every tile is labelled **Saved** or **Temporary**. Duplicate detection uses the original URI; picking the same source again with a different cache URI may add another copy.
 
-The scan reads metadata from already initialized Metro modules and lists relevant native module identifiers. It does not force-load modules, call photo APIs, evaluate export getters, read photo contents, or include property values such as filenames, file paths, message text or credentials. Nothing is uploaded automatically. Reports are kept in memory until plugin unload; the copy button writes the report to the clipboard. Names may be stripped from production code, so a report may still be insufficient to locate the tray.
+Removing a Saved item attempts to delete only its generated private copy. If native deletion fails, that copy may remain in app storage. Removing an entry never deletes the source photo. Uninstalling only the plugin may leave its private files behind; use Manage to remove saved entries first if desired.
 
-The older Files gallery below remains experimental. Its column/sorting settings apply only to that custom gallery if the required interfaces are detected, and do not affect the built-in Photos tray.
+## Status and testing limits
 
-A **real, experimental classic Vendetta-family plugin**. Targets Kettu's Discord Android **Attach File** action. It aims to open a photo grid *inside Discord* with persistent settings: 3, 4, 5, or 6 columns; sorting among loaded photos; and instant single-tap attachment or multi-selection.
+Local tests pass for the loader, custom modal, imports, private copies and temporary fallback, filters, favorites, multi-select, ten-photo cap, composer attachments, disabled fallback, file expiry, command behavior and cleanup. These use mocked Kettu/React Native interfaces. **The 0.2.0 UI and native file copying still need verification on the user's phone.** A working 0.1.x settings screen or module report does not establish these new paths work on-device.
 
-**Status:** Source and loader smoke tests passed, **not tested on a physical device**. Discord's internal media modules change frequently. This is NOT a confirmed working replacement for the stock thumbnail tray on any specific Discord/Kettu build.
+The Files shortcut uses the existing Vendetta-family attachment hook and normal composer selection handler. If it cannot open the custom UI synchronously, it falls back to the original Files action. This plugin does not send messages, upload photos independently, collect diagnostics, or make network requests. Disabling it restores the normal Files flow.
 
-## What it changes
+## Hosting
 
-- Intercepts the Discord `handleAttachFile` action. This hook was verified from fres's AltMediaPicker Vendetta plugin source.
-- If the Discord build exposes a CameraRoll-compatible `getPhotos` module and Vendetta's custom-alert interface, it opens a grid without switching apps.
-- The grid supports **3–6 columns**, **newest/oldest/filename sort**, paging in groups of up to 120, an optional **single-tap attach**, and a **System picker** fallback button.
-- Uses Discord's `handleSelectKeyboardItem` to add selected photos to the current composer (up to 10 per batch). It does **not** directly send Discord messages.
-- The plugin stores only its own settings in Vendetta's local plugin storage. No network access, telemetry, tokens, or photo uploads are implemented.
+The deployable files are `docs/BetterMediaPicker/index.js` and `manifest.json`. Publish GitHub Pages from **main /docs**. More plugins can use their own subfolders under docs.
 
-### Known limitations
+Install the folder URL in Kettu:
 
-- Sorting applies **only to the photos loaded so far**, not all photos in your library. Selecting "oldest" does *not* fetch the absolute oldest photos automatically.
-- The native CameraRoll module may not be exposed on your build. In that case **the plugin intentionally doesn't install a hook** and stock Discord behaves as before.
-- Photos only; no video, folders, search, camera capture, or album filtering yet.
-- It modifies the Attach File action, not necessarily the inline thumbnail strip shown immediately upon tapping +. The exact behavior depends on your client build.
-- Settings change immediately, but toggling the plugin's *enabled* flag while already loaded only changes interception behavior, not whether the hook is installed.
-- The custom alert may behave differently on newer Kettu/Discord versions. On-device testing is required.
-- No APK or root is required. However, unofficial Discord modifications may violate Discord's terms and can create account risks. Test with care.
+`https://boyg22820-a11y.github.io/Discord-plug-ins-/BetterMediaPicker/`
 
-## Install on Kettu via GitHub Pages
-
-This ZIP is **not** an Android APK and the raw ZIP is **not** a direct install link for Kettu.
-
-1. Make a GitHub repository (for example `better-media-picker`).
-2. Extract this ZIP and **upload the contents of the `docs` directory into a `docs` folder at your repository root**. You should have `docs/BetterMediaPicker/index.js` and `docs/BetterMediaPicker/manifest.json` in GitHub.
-3. Repository **Settings → Pages → Deploy from a branch**. Choose branch `main`, directory `/docs`, Save.
-4. Confirm the URL `https://YOURNAME.github.io/better-media-picker/BetterMediaPicker/manifest.json` opens as JSON in your browser.
-5. In **Kettu → Settings → Plugins → +**, paste **the folder URL without `manifest.json`**:
-
-   `https://YOURNAME.github.io/better-media-picker/BetterMediaPicker/`
-
-6. Enable the plugin, reload Discord, then open plugin settings for diagnostics. Try **+ → Attach File** in a DM where you can safely test.
-7. If CameraRoll is missing or the gallery does not open, disable/uninstall the plugin. The plugin should leave the normal picker alone when the needed APIs are missing.
-
-### Local Android hosting (optional)
-
-If you already have Termux, copy the `docs` folder to Termux and run `python -m http.server 8765 --directory docs`. While the server stays running on your phone, install `http://127.0.0.1:8765/BetterMediaPicker/` in Kettu. Whether local HTTP links are allowed depends on Kettu's loader. This is for development, not everyday use.
-
-## Testing checklist
-
-1. Open Kettu's plugin settings. Check **Status**, **Media bridge**, **Discord attach hook**, **Sheet UI**. No account token or chat logs are needed.
-2. Tap + → Attach File. Confirm whether the custom gallery opens. If the original remains, the target UI may be a different component or the media API was absent.
-3. Tap the `4 columns` button; it should cycle 4 → 5 → 6 → 3. Tap `Sort: newest`; it should cycle newest → oldest → filename.
-4. Tap one image with instant attach enabled. It should appear in the composer; **review it before sending**.
-5. Turn off instant attach in plugin settings, reload the picker, select two images, and tap `Attach 2`.
-6. Turn the plugin off or disable in settings, then confirm Discord's original flow returns.
-
-**If testing fails:** Record the Kettu version, Discord version and the four diagnostic statuses (not your token). A screenshot of the non-sensitive picker UI helps target the next patch.
-
-## Architecture
-
-This is a deliberately dependency-free, prebuilt JavaScript expression for *classic* Vendetta-compatible clients (including Kettu builds that retain the classic plugin loader). The entrypoint gets a `vendetta` object provided by the loader. Vendetta-style plugin code is evaluated as an expression returning `{onLoad,onUnload,settings}`.
-
-Source = `index.js`; deployable files = `docs/BetterMediaPicker/index.js` and `manifest.json`. Both JavaScript files are identical. This package does not target Revenge Next's newer ZIP/plugin repository format.
-
-## Source references
-
-- Vendetta plugin template: https://github.com/vendetta-mod/plugin-template
-- fres's AltMediaPicker source: https://github.com/fres621/vendetta-plugins/blob/master/plugins/AltMediaPicker/src/patch.ts
-- Kettu source: https://github.com/C0C0B01/Kettu
-
-## Run the local tests
-
-From the extracted directory with Node.js installed:
+## Validation
 
 `node tests/smoke.mjs`
 
-Tests validate the plugin expression and safe fallback **against mocks**, not against a running Discord app.
+## Implementation references
+
+- Kettu Vendetta compatibility API: https://github.com/C0C0B01/Kettu/blob/main/src/core/vendetta/api.tsx
+- Kettu custom alert integration: https://github.com/C0C0B01/Kettu/blob/main/src/core/vendetta/alerts.ts
+- Kettu native file interface: https://github.com/C0C0B01/Kettu/blob/main/src/lib/api/native/modules/types.ts
+- Kettu command lifecycle: https://github.com/C0C0B01/Kettu/blob/main/src/lib/api/commands/index.ts
+- Original Files action/composer bridge: https://github.com/fres621/vendetta-plugins/blob/master/plugins/AltMediaPicker/src/patch.ts
+- Image picker contract: https://github.com/react-native-image-picker/react-native-image-picker

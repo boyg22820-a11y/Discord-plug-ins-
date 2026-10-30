@@ -1,496 +1,365 @@
 (() => {
   "use strict";
-  const VERSION = "0.1.2";
+  const VERSION = "0.2.0";
+  const MAX_COLLECTION = 1000;
+  const MAX_BATCH = 10;
+  const MAX_COPY_BYTES = 20 * 1024 * 1024;
+  const COPY_PREFIX = "better-media-picker/photos/";
   const COLS = [3, 4, 5, 6];
   const SORTS = ["newest", "oldest", "filename"];
-  const unpatches = [];
-  let runtime = "Not started";
-  let active = false;
-
-  const safeFind = (fn) => { try { return fn(); } catch (_) { return null; } };
+  const SORT_LABELS = { newest: "Recently added", oldest: "Oldest added", filename: "Filename" };
   const metro = vendetta.metro;
   const React = metro.common.React;
   const RN = metro.common.ReactNative;
   const E = React.createElement;
   const storage = vendetta.plugin.storage;
-  const getTarget = () => safeFind(() => metro.findByProps("handleAttachFile"));
-  const getCameraRoll = () => safeFind(() => metro.findByProps("getPhotos"));
-  const getNativePicker = () => safeFind(() => metro.findByProps("launchImageLibrary"));
-  const getChannel = () => safeFind(() => metro.findByStoreName("SelectedChannelStore"));
-  const getSheets = () => safeFind(() => metro.findByProps("openLazy", "hideActionSheet"));
-  const notify = (message) => { try { vendetta.logger.log(`[BetterMediaPicker] ${message}`); } catch (_) {} };
-
-  function initializeDefaults() {
+  const cleanups = [];
+  const pendingPicks = new Set();
+  const openViews = new Set();
+  let temporaryPhotos = [];
+  let running = false;
+  let generation = 0;
+  let pickerOpen = false;
+  let importBusy = false;
+  let runtime = "Not started";
+  let lastNotice = "";
+  const safe = fn => { try { return fn(); } catch (_) { return null; } };
+  const find = (...props) => safe(() => metro.findByProps(...props));
+  const target = () => find("handleAttachFile", "handleSelectKeyboardItem");
+  const channelStore = () => safe(() => metro.findByStoreName("SelectedChannelStore"));
+  const currentChannel = () => safe(() => channelStore().getChannelId());
+  const tell = text => { lastNotice = text; safe(() => vendetta.ui.toasts.showToast(text)); };
+  function defaults() {
     if (!COLS.includes(storage.columns)) storage.columns = 4;
     if (!SORTS.includes(storage.sort)) storage.sort = "newest";
     if (typeof storage.instant !== "boolean") storage.instant = true;
     if (typeof storage.enabled !== "boolean") storage.enabled = true;
+    if (!Array.isArray(storage.quickPhotos)) storage.quickPhotos = [];
   }
-  const txt = (value, style) => E(RN.Text, { style: [
-    { color: "#f2f3f5", fontSize: 14 }, style || {}
-  ] }, value);
-  const button = (text, press, selected, extraStyle) => E(RN.TouchableOpacity, {
-    onPress: press, accessibilityRole: "button",
-    style: [{ paddingVertical: 11, paddingHorizontal: 12, borderRadius: 9, margin: 3,
-      backgroundColor: selected ? "#5865f2" : "#36393f" }, extraStyle || {}]
-  }, txt(text, { fontWeight: selected ? "700" : "500", textAlign: "center" }));
-  const heading = (label) => txt(label, { fontWeight: "700", marginTop: 14, marginBottom: 7, fontSize: 15 });
-
-  function normalize(edge, index) {
-    const n = edge && (edge.node || edge);
-    const image = n && n.image;
-    const uri = image && image.uri;
-    if (!uri || typeof uri !== "string") return null;
-    return {
-      id: String(n.id || uri || index), uri,
-      filename: String((image && (image.filename || image.fileName)) || n.filename || `image-${index}.jpg`),
-      timestamp: Number(n.timestamp || n.modificationTimestamp || 0) || 0,
-      height: Number((image && image.height) || 0) || 0,
-      width: Number((image && image.width) || 0) || 0,
-      mimeType: String(n.type || "image/jpeg"),
-      playableDuration: Number((image && image.playableDuration) || 0) || 0
-    };
+  function fileManager() {
+    for (const name of ["NativeFileModule", "RTNFileManager", "DCDFileManager"]) {
+      const native = safe(() => RN.NativeModules && RN.NativeModules[name]) ||
+        safe(() => globalThis.__turboModuleProxy && globalThis.__turboModuleProxy(name));
+      if (native && typeof native.readFile === "function" && typeof native.writeFile === "function" && typeof native.getConstants === "function") return native;
+    }
+    const fallback = find("readFile", "writeFile", "getConstants");
+    return fallback && typeof fallback.readFile === "function" && typeof fallback.writeFile === "function" ? fallback : null;
   }
-
+  function isManaged(name) {
+    return typeof name === "string" && /^better-media-picker\/photos\/[a-z0-9_-]+\.(jpg|png|gif|webp|heic|heif|avif)$/.test(name);
+  }
+  async function deleteCopy(item) {
+    if (!isManaged(item.managedPath)) return;
+    const fm = fileManager();
+    if (fm && typeof fm.removeFile === "function") {
+      try { await fm.removeFile("documents", item.managedPath); } catch (_) {}
+    }
+  }
+  function collection() { return [...storage.quickPhotos, ...temporaryPhotos]; }
+  function setFavorite(id) {
+    storage.quickPhotos = storage.quickPhotos.map(p => p.id === id ? { ...p, favorite: !p.favorite } : p);
+    temporaryPhotos = temporaryPhotos.map(p => p.id === id ? { ...p, favorite: !p.favorite } : p);
+  }
+  async function removePhoto(id) {
+    const item = collection().find(p => p.id === id);
+    if (!item) return;
+    storage.quickPhotos = storage.quickPhotos.filter(p => p.id !== id);
+    temporaryPhotos = temporaryPhotos.filter(p => p.id !== id);
+    await deleteCopy(item);
+  }
   function ordered(items, mode) {
-    const result = items.slice();
-    if (mode === "filename") result.sort((a, b) => a.filename.localeCompare(b.filename, undefined, { numeric: true }));
-    else result.sort((a, b) => mode === "oldest" ? a.timestamp - b.timestamp : b.timestamp - a.timestamp);
-    return result;
+    return items.slice().sort((a, b) => mode === "filename"
+      ? a.filename.localeCompare(b.filename, undefined, { numeric: true })
+      : mode === "oldest" ? a.addedAt - b.addedAt : b.addedAt - a.addedAt);
   }
-
-  function hideSheet() {
-    try { const m = getSheets(); if (m && typeof m.hideActionSheet === "function") m.hideActionSheet();
-      else if (m && typeof m.close === "function") m.close();
-    } catch (e) { notify(`Close failed: ${String(e)}`); }
-  }
-
-  function attachItems(items) {
-    const target = getTarget();
-    const store = getChannel();
-    const channelId = store && (store.getChannelId && store.getChannelId());
-    if (!channelId || !target || typeof target.handleSelectKeyboardItem !== "function") {
-      throw new Error("Discord's attachment handler or selected channel is unavailable");
-    }
-    // Use Discord's actual composer selection handler, not a direct upload request.
-    items.slice(0, 10).forEach((item) => {
-      target.handleSelectKeyboardItem(channelId, {
-        node: { image: {
-          playableDuration: item.playableDuration, height: item.height,
-          filename: item.filename, width: item.width,
-          mimeType: item.mimeType, uri: item.uri
-        }, type: "ALAssetTypePhoto" }
-      }, false, { target: 0 }, undefined);
-    });
-  }
-
-  function launchSystemPicker() {
-    const native = getNativePicker();
-    if (!native || typeof native.launchImageLibrary !== "function") {
-      throw new Error("No native photo picker was exposed by this Discord version");
-    }
-    hideSheet();
-    native.launchImageLibrary({ mediaType: "photo", selectionLimit: 10 }, (response) => {
-      if (!response || response.didCancel || response.errorCode || !Array.isArray(response.assets)) return;
-      const items = response.assets.slice(0, 10).filter(a => a && a.uri).map((a, i) => ({
-        uri: a.uri, filename: a.fileName || `photo-${i}.jpg`,
-        mimeType: a.type || "image/jpeg", width: a.width || 0,
-        height: a.height || 0, playableDuration: 0
-      }));
-      try { if (items.length) attachItems(items); } catch (e) { notify(`Native attach: ${String(e)}`); }
-    });
-  }
-
-  function Picker() {
-    const [items, setItems] = React.useState([]);
-    const [cursor, setCursor] = React.useState(null);
-    const [hasNext, setHasNext] = React.useState(false);
-    const [busy, setBusy] = React.useState(false);
-    const [error, setError] = React.useState("");
-    const [selection, setSelection] = React.useState([]);
-    const [prefs, setPrefs] = React.useState({ columns: storage.columns, sort: storage.sort, instant: storage.instant });
-    const [loadingCount, setLoadingCount] = React.useState(0);
-    const viewportWidth = RN.Dimensions.get("window").width;
-    const columns = COLS.includes(prefs.columns) ? prefs.columns : 4;
-    const tile = Math.floor((viewportWidth - 34) / columns) - 4;
-
-    async function loadMore(next) {
-      const camera = getCameraRoll();
-      if (!camera || typeof camera.getPhotos !== "function") {
-        setError("This Discord build does not expose a compatible CameraRoll.getPhotos API.");
-        return;
-      }
-      if (busy) return;
-      setBusy(true);
-      setError("");
+  function pickPhotos() {
+    const api = find("launchImageLibrary");
+    if (!api || typeof api.launchImageLibrary !== "function") return Promise.reject(new Error("Android picker unavailable"));
+    return new Promise((resolve, reject) => {
+      let done = false;
+      const cancel = () => finish({ didCancel: true });
+      const finish = response => {
+        if (done) return;
+        done = true;
+        pendingPicks.delete(cancel);
+        resolve(response || { didCancel: true });
+      };
+      pendingPicks.add(cancel);
       try {
-        const params = { first: 120, assetType: "Photos", include: ["filename", "imageSize"] };
-        if (next) params.after = next;
-        const page = await camera.getPhotos(params);
-        const edges = page && page.edges;
-        if (!Array.isArray(edges)) throw new Error("Photo API returned an unexpected response");
-        const mapped = edges.map(normalize).filter(Boolean);
-        setItems(prev => {
-          const seen = new Set(prev.map(a => a.id));
-          return prev.concat(mapped.filter(a => !seen.has(a.id)));
+        const result = api.launchImageLibrary({ mediaType: "photo", selectionLimit: 100 }, finish);
+        if (result && typeof result.then === "function") result.then(finish, () => {
+          if (!done) { done = true; pendingPicks.delete(cancel); reject(new Error("Android picker failed")); }
         });
-        const info = page.page_info || page.pageInfo || {};
-        setCursor(info.end_cursor || info.endCursor || null);
-        setHasNext(Boolean(info.has_next_page || info.hasNextPage));
-        setLoadingCount(n => n + 1);
-      } catch (e) { setError(String(e && e.message || e)); }
-      finally { setBusy(false); }
-    }
-    React.useEffect(() => { loadMore(null); }, []);
-
-    const sorted = ordered(items, prefs.sort);
-    const selectedSet = new Set(selection.map(s => s.id));
-    function selectPhoto(item) {
-      if (prefs.instant) {
-        try { attachItems([item]); hideSheet(); } catch (e) { setError(String(e && e.message || e)); }
-        return;
-      }
-      setSelection(current => current.some(s => s.id === item.id)
-        ? current.filter(s => s.id !== item.id)
-        : current.length >= 10 ? current : current.concat([item]));
-    }
-    function attachSelected() {
-      if (!selection.length) return;
-      try { attachItems(selection); hideSheet(); } catch (e) { setError(String(e && e.message || e)); }
-    }
-    function changeColumns() {
-      const i = COLS.indexOf(columns), next = COLS[(i + 1) % COLS.length];
-      storage.columns = next; setPrefs(p => ({ ...p, columns: next }));
-    }
-    function changeSort() {
-      const i = SORTS.indexOf(prefs.sort), next = SORTS[(i + 1) % SORTS.length];
-      storage.sort = next; setPrefs(p => ({ ...p, sort: next }));
-    }
-    const imageGrid = E(RN.FlatList, {
-      key: `grid-${columns}`,
-      data: sorted,
-      numColumns: columns,
-      keyExtractor: (item, i) => `${item.id}:${i}`,
-      initialNumToRender: columns * 8,
-      windowSize: 5,
-      style: { flexGrow: 0, maxHeight: RN.Dimensions.get("window").height * 0.57 },
-      contentContainerStyle: { paddingBottom: 8 },
-      renderItem: ({ item }) => E(RN.TouchableOpacity, {
-        onPress: () => selectPhoto(item), accessibilityRole: "button",
-        accessibilityLabel: `Attach ${item.filename}`,
-        style: { width: tile, height: tile, margin: 2,
-          borderWidth: selectedSet.has(item.id) ? 3 : 0,
-          borderColor: "#5865f2", backgroundColor: "#313338", borderRadius: 4 }
-      }, E(RN.Image, { source: { uri: item.uri }, resizeMode: "cover",
-          style: { width: "100%", height: "100%", borderRadius: 4 } }),
-        selectedSet.has(item.id) ? E(RN.View, { style: { position: "absolute", right: 3, top: 3,
-          backgroundColor: "#5865f2", borderRadius: 9, paddingHorizontal: 5 } }, txt("✓")) : null),
-      ListEmptyComponent: busy ? txt("Loading photos…") : txt(error ? "" : "No photos returned."),
-      ListFooterComponent: hasNext ? button(busy ? "Loading…" : "Load more photos", () => loadMore(cursor), false) : null
+      } catch (_) { done = true; pendingPicks.delete(cancel); reject(new Error("Android picker could not open")); }
     });
-    return E(RN.View, { style: { backgroundColor: "#232428", padding: 10, borderRadius: 12,
-      maxHeight: RN.Dimensions.get("window").height * 0.83 } },
-      E(RN.View, { style: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" } },
-        txt("BetterMediaPicker", { fontWeight: "700", fontSize: 17 }),
-        button("Close", hideSheet, false)),
-      E(RN.View, { style: { flexDirection: "row", flexWrap: "wrap" } },
-        button(`${columns} columns`, changeColumns, true),
-        button(`Sort: ${prefs.sort}`, changeSort, true),
-        button("System picker", () => { try { launchSystemPicker(); } catch (e) { setError(String(e)); } }, false)),
-      error ? txt(error, { color: "#ffb3b3", marginVertical: 8 }) : null,
-      imageGrid,
-      E(RN.View, { style: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" } },
-        txt(`${items.length} loaded · ${loadingCount} page(s) · ${prefs.instant ? "tap to attach" : "multi-select"}`,
-          { color: "#a8abb5", fontSize: 11 }),
-        prefs.instant ? null : button(`Attach ${selection.length}`, attachSelected, !!selection.length))
-    );
   }
-
-
-  // Inspect only metadata of already initialized modules. Never require modules,
-  // invoke exported methods, evaluate getters, or include property values.
-  let diagnosticReport = "Open a chat, tap + and Photos, then return here and tap Scan loaded modules.";
-  let scanGeneration = 0;
-  let scanning = false;
-  const relevantName = /camera.?roll|photo|gallery|(?:media|image|asset|attachment).*(?:picker|library)|(?:picker|library).*(?:media|image|asset|attachment)|^getAssets$|^getAlbums$|^handleSelectKeyboardItem$/i;
-  const identifier = /^[A-Za-z_$][A-Za-z0-9_$]{0,95}$/;
-  const ownValue = (object, key) => {
-    if (!object || (typeof object !== "object" && typeof object !== "function")) return undefined;
-    try { const d = Object.getOwnPropertyDescriptor(object, key); return d && d.value; }
-    catch (_) { return undefined; }
-  };
-  const ownNames = object => {
-    try { return Object.getOwnPropertyNames(object).filter(k => identifier.test(k)); }
-    catch (_) { return []; }
-  };
-  function metadata(object) {
-    if (!object || (typeof object !== "object" && typeof object !== "function")) return [];
-    const hits = ownNames(object).filter(k => relevantName.test(k));
-    for (const key of ["name", "displayName"]) {
-      const name = ownValue(object, key);
-      if (typeof name === "string" && identifier.test(name) && relevantName.test(name)) hits.push(name);
-    }
-    // React.memo / forwardRef wrappers, without traversing props or state.
-    for (const key of ["render", "type"]) {
-      const fn = ownValue(object, key);
-      const name = ownValue(fn, "displayName") || ownValue(fn, "name");
-      if (typeof name === "string" && identifier.test(name) && relevantName.test(name)) hits.push(name);
-    }
-    return Array.from(new Set(hits)).sort().slice(0, 16);
+  function normalizeAsset(asset, index) {
+    if (!asset || typeof asset.uri !== "string" || !/^(file|content):\/\//.test(asset.uri)) return null;
+    if (asset.type && !String(asset.type).startsWith("image/")) return null;
+    const type = typeof asset.type === "string" ? asset.type : "image/jpeg";
+    const filename = String(asset.fileName || asset.filename || `photo-${index + 1}.jpg`);
+    const id = `${Date.now().toString(36)}-${index.toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    return { id, uri: asset.uri, sourceKey: asset.uri,
+      filename, mimeType: type, width: Number(asset.width) || 0, height: Number(asset.height) || 0,
+      fileSize: Number(asset.fileSize) || 0, addedAt: Date.now() + index, favorite: false };
   }
-  function diagnosticVersions() {
-    const info = safeFind(() => vendetta.debug.getDebugInfo());
-    const cleanVersion = v => typeof v === "string" || typeof v === "number"
-      ? String(v).replace(/[^A-Za-z0-9 ._()+-]/g, "").slice(0, 80) : "unknown";
-    return [
-      `Plugin: ${VERSION}`,
-      `Kettu: ${cleanVersion(info && info.bunny && info.bunny.version)}`,
-      `Discord: ${cleanVersion(info && info.discord && info.discord.version)}`,
-      `React Native: ${cleanVersion(info && info.react && info.react.nativeVersion)}`
-    ];
-  }
-  async function scanLoadedModules() {
-    if (scanning) return diagnosticReport;
-    scanning = true;
-    const generation = ++scanGeneration;
-    const rows = diagnosticVersions();
-    const modules = metro.modules;
-    let loaded = 0, matched = 0, shown = 0;
+  async function keepCopy(item, fm) {
+    if (!fm || item.fileSize <= 0 || item.fileSize > MAX_COPY_BYTES) return item;
+    let managedPath;
     try {
-      if (!modules || typeof modules !== "object") {
-        rows.push("Loaded module registry unavailable on this client.");
-      } else {
-        const ids = Object.keys(modules).filter(id => /^\d+$/.test(id));
-        for (let offset = 0; offset < ids.length; offset += 150) {
-          if (generation !== scanGeneration) return diagnosticReport;
-          for (const id of ids.slice(offset, offset + 150)) {
-            const record = ownValue(modules, id);
-            if (ownValue(record, "isInitialized") !== true || ownValue(record, "hasError")) continue;
-            loaded++;
-            const exports = ownValue(ownValue(record, "publicModule"), "exports");
-            const hits = metadata(exports).concat(metadata(ownValue(exports, "default")));
-            // Named exports may contain memoized or named picker components.
-            for (const key of ownNames(exports).slice(0, 300)) {
-              const child = ownValue(exports, key);
-              if (typeof child === "function" || (child && typeof child === "object" && ownValue(child, "$$typeof"))) {
-                hits.push(...metadata(child));
-              }
-            }
-            if (hits.length) {
-              matched++;
-              if (shown++ < 120) rows.push(`Module ${id}: ${Array.from(new Set(hits)).slice(0, 16).join(", ")}`);
-            }
-          }
-          await new Promise(resolve => setTimeout(resolve, 0));
-        }
-        rows.push(`Initialized modules: ${loaded}; matching modules: ${matched}; shown: ${Math.min(shown, 120)}`);
+      const constants = fm.getConstants();
+      const documents = constants && constants.DocumentsDirPath;
+      if (typeof documents !== "string" || !documents.startsWith("/")) return item;
+      const extByType = { "image/png": "png", "image/gif": "gif", "image/webp": "webp", "image/heic": "heic", "image/heif": "heif", "image/avif": "avif" };
+      const ext = extByType[item.mimeType] || "jpg";
+      managedPath = COPY_PREFIX + item.id + "." + ext;
+      const path = item.uri.startsWith("file://") ? decodeURI(item.uri.slice(7)) : item.uri;
+      const base64 = await fm.readFile(path, "base64");
+      if (typeof base64 !== "string" || !base64.length || base64.length > Math.ceil(MAX_COPY_BYTES / 3) * 4) return item;
+      await fm.writeFile("documents", managedPath, base64, "base64");
+      const full = documents.replace(/\/$/, "") + "/" + managedPath;
+      // Where supported, verify that the native write produced a usable file.
+      if (typeof fm.fileExists === "function" && !(await fm.fileExists(full))) {
+        await deleteCopy({ managedPath }); return item;
       }
-      // List native module identifiers only. Never read module getters or invoke
-      // native/turbo module lookup functions based on guessed module names.
-      const native = RN.NativeModules;
-      if (native) rows.push("Native names: " + ownNames(native).filter(k => relevantName.test(k)).slice(0, 60).join(", "));
-      rows.push("Metadata only. No photos, filenames, paths, messages, account IDs, or tokens are collected. No automatic upload.");
-      if (generation === scanGeneration) diagnosticReport = rows.join("\n");
+      return { ...item, uri: "file://" + full, managedPath };
     } catch (_) {
-      if (generation === scanGeneration) diagnosticReport = rows.concat("Scan could not finish on this client.").join("\n");
-    } finally {
-      if (generation === scanGeneration) scanning = false;
+      if (managedPath) await deleteCopy({ managedPath });
+      return item;
     }
-    return diagnosticReport;
   }
-
-
-  // Observe real tray calls instead of guessing this private API's signature.
-  let stopObservation = null;
-  let observationTimer = null;
-  let observationGeneration = 0;
-  let observationStatus = "Not started";
-  let observationLines = [];
-  const schemaKeys = new Set(("first limit offset after before cursor assetType mediaType include sort sortBy sortOrder order ascending descending groupName album albumId groupTypes mimeTypes fromTime toTime " +
-    "edges node image photos assets media items data results result page page_info pageInfo has_next_page hasNextPage end_cursor endCursor nextCursor next hasMore total count " +
-    "uri url path filename fileName name id identifier type mimeType timestamp creationTime modificationTime modificationTimestamp width height duration playableDuration size fileSize " +
-    "location latitude longitude albums imageSize start end success error code").split(/\s+/));
-  function shape(value, depth = 0) {
-    if (value === null) return "null";
-    if (depth > 4) return Array.isArray(value) ? "array" : typeof value;
-    if (Array.isArray(value)) {
-      // Length and the first element's field types only; no values.
-      return { kind: "array", length: value.length, sample: value.length ? shape(ownValue(value, "0"), depth + 1) : null };
-    }
-    if (typeof value === "object") {
-      const result = {};
-      const names = ownNames(value);
-      let unknown = 0;
-      for (const name of names) {
-        if (!schemaKeys.has(name)) { unknown++; continue; }
-        const desc = Object.getOwnPropertyDescriptor(value, name);
-        result[name] = desc && "value" in desc ? shape(desc.value, depth + 1) : "accessor (not read)";
-      }
-      if (unknown) result.otherFieldCount = unknown;
-      return result;
-    }
-    return typeof value;
-  }
-  function fullDiagnosticReport() {
-    return diagnosticReport + "\n\nPhotos API observation: " + observationStatus +
-      (observationLines.length ? "\n" + observationLines.join("\n") : "");
-  }
-  function endObservation() {
-    if (observationTimer !== null) { clearTimeout(observationTimer); observationTimer = null; }
-    if (stopObservation) { const undo = stopObservation; stopObservation = null; try { undo(); } catch (_) {} }
-  }
-  function observePhotosAPI() {
-    endObservation();
-    const generation = ++observationGeneration;
-    observationLines = [];
-    let owner = null;
-    const modules = metro.modules;
-    for (const id of Object.keys(modules || {})) {
-      if (!/^\d+$/.test(id)) continue;
-      const record = ownValue(modules, id);
-      if (ownValue(record, "isInitialized") !== true || ownValue(record, "hasError")) continue;
-      const exp = ownValue(ownValue(record, "publicModule"), "exports");
-      for (const candidate of [exp, ownValue(exp, "default")]) {
-        if (!candidate || !Object.prototype.hasOwnProperty.call(candidate, "getDeviceMediaPhotos")) continue;
-        // Read this single identified export; don't invoke the photo function.
-        const fn = safeFind(() => candidate.getDeviceMediaPhotos);
-        if (typeof fn === "function") { owner = candidate; break; }
-      }
-      if (owner) break;
-    }
-    if (!owner) { observationStatus = "getDeviceMediaPhotos not loaded. Open Photos once, then try again."; return; }
-    observationLines.push("getDeviceMediaPhotos declared arguments: " + owner.getDeviceMediaPhotos.length);
+  async function addPhotos(onProgress) {
+    if (importBusy) return { message: "Another import is already open." };
+    if (collection().length >= MAX_COLLECTION) return { message: "Collection full. Remove some photos first." };
+    importBusy = true;
+    const token = generation;
+    let added = 0, saved = 0, duplicates = 0;
     try {
-      let calls = 0;
-      stopObservation = vendetta.patcher.instead("getDeviceMediaPhotos", owner, (args, original) => {
-        const record = generation === observationGeneration && calls++ < 3;
-        if (record) {
-          observationStatus = "Observed real Photos API call";
-          try { observationLines.push("Arguments: " + JSON.stringify(args.map(arg => shape(arg)))); } catch (_) {}
-        }
-        let result;
-        try { result = original(...args); }
-        catch (error) {
-          if (record) observationLines.push("Original API threw (error contents omitted)");
-          throw error;
-        }
-        if (record) {
-          try {
-            if (result && typeof result.then === "function") {
-              observationLines.push("Returns a promise");
-              Promise.resolve(result).then(value => {
-                if (generation === observationGeneration) {
-                  try { observationLines.push("Resolved shape: " + JSON.stringify(shape(value))); } catch (_) {}
-                }
-              }, () => { if (generation === observationGeneration) observationLines.push("Promise rejected (error contents omitted)"); });
-            } else observationLines.push("Returned shape: " + JSON.stringify(shape(result)));
-          } catch (_) {}
-        }
-        return result;
-      });
-      observationStatus = "Listening for 60 seconds. Open + → Photos, scroll, then return here.";
-      observationTimer = setTimeout(() => {
-        if (generation !== observationGeneration) return;
-        endObservation();
-        observationStatus = calls ? "Capture finished" : "No call observed. The tray may have reused cached photos or another API.";
-      }, 60000);
-    } catch (_) { observationStatus = "Export could not be observed on this build. No photo API was invoked."; }
+      const response = await pickPhotos();
+      if (!running || token !== generation || response.didCancel) return { message: "Import cancelled." };
+      if (response.errorCode || !Array.isArray(response.assets)) return { message: "Android did not return photos. Try Add photos again." };
+      const fm = fileManager();
+      const existing = new Set(collection().map(p => p.sourceKey));
+      const room = MAX_COLLECTION - collection().length;
+      const assets = response.assets.slice(0, Math.min(100, room));
+      for (let i = 0; i < assets.length; i++) {
+        if (!running || token !== generation) break;
+        let item = normalizeAsset(assets[i], i);
+        if (!item) continue;
+        if (existing.has(item.sourceKey)) { duplicates++; continue; }
+        item = await keepCopy(item, fm);
+        if (!running || token !== generation) { await deleteCopy(item); break; }
+        if (item.managedPath) { storage.quickPhotos = [...storage.quickPhotos, item]; saved++; }
+        else temporaryPhotos.push(item);
+        existing.add(item.sourceKey); added++;
+        if (onProgress) onProgress(added);
+      }
+      const limited = response.assets.length > assets.length ? " Selection exceeded the import limit; add the rest in another batch." : "";
+      const temp = added - saved;
+      return { message: `Added ${added} photo(s). ${saved} saved locally.` +
+        (temp ? ` ${temp} temporary: re-add if the previews expire or Kettu reloads.` : "") +
+        (duplicates ? ` ${duplicates} duplicate(s) skipped.` : "") + limited };
+    } catch (_) { return { message: "Import could not finish. Try Add photos again." }; }
+    finally { if (token === generation) importBusy = false; }
   }
+  async function attachPhotos(items, channelId) {
+    if (!running) throw new Error("Plugin is disabled.");
+    if (!channelId || currentChannel() !== channelId) throw new Error("Return to the chat where you opened Quick Photos.");
+    const api = target();
+    if (!api || typeof api.handleSelectKeyboardItem !== "function") throw new Error("Attachment interface unavailable on this build.");
+    const fm = fileManager();
+    const batch = items.slice(0, MAX_BATCH);
+    // Validate known file copies before touching the composer.
+    if (fm && typeof fm.fileExists === "function") {
+      for (const item of batch) {
+        if (item.uri.startsWith("file://") && !(await fm.fileExists(decodeURI(item.uri.slice(7))))) {
+          throw new Error("A photo is no longer available. Remove it from Quick Photos and add it again.");
+        }
+      }
+    }
+    if (!running || currentChannel() !== channelId) throw new Error("The active chat changed. Open Quick Photos again.");
+    for (const item of batch) {
+      try {
+        api.handleSelectKeyboardItem(channelId, { node: { image: {
+          playableDuration: 0, height: item.height, filename: item.filename,
+          width: item.width, mimeType: item.mimeType, uri: item.uri
+        }, type: "ALAssetTypePhoto" } }, false, { target: 0 }, undefined);
+      } catch (_) { throw new Error("Could not attach every photo. Check the composer before trying again."); }
+    }
+  }
+  function closeAlert() { safe(() => find("openLazy", "close").close()); }
+  const txt = (text, style) => E(RN.Text, { style: [{ color: "#f2f3f5", fontSize: 14 }, style] }, text);
+  const button = (label, onPress, selected = false, disabled = false) => E(RN.TouchableOpacity, {
+    onPress, disabled, accessibilityRole: "button", accessibilityLabel: label,
+    style: { paddingVertical: 10, paddingHorizontal: 12, margin: 3, borderRadius: 10,
+      backgroundColor: selected ? "#5865f2" : "#36393f", opacity: disabled ? 0.5 : 1 }
+  }, txt(label, { textAlign: "center", fontWeight: "600" }));
+  const row = (...children) => E(RN.View, { style: { flexDirection: "row", flexWrap: "wrap", alignItems: "center" } }, ...children);
+  const heading = label => txt(label, { fontSize: 17, fontWeight: "700", marginTop: 18, marginBottom: 8 });
 
-  function Settings() {
-    const [refresh, setRefresh] = React.useState(0);
-    const [report, setReport] = React.useState(fullDiagnosticReport());
+  function Picker({ channelId }) {
+    const [items, setItems] = React.useState(collection());
+    const [columns, setColumns] = React.useState(storage.columns);
+    const [sort, setSort] = React.useState(storage.sort);
+    const [instant, setInstant] = React.useState(storage.instant);
+    const [favorites, setFavorites] = React.useState(false);
+    const [query, setQuery] = React.useState("");
+    const [selection, setSelection] = React.useState([]);
+    const [managing, setManaging] = React.useState(false);
     const [busy, setBusy] = React.useState(false);
-    const [copyStatus, setCopyStatus] = React.useState("");
+    const [notice, setNotice] = React.useState("");
+    const [visible, setVisible] = React.useState(true);
+    const [failed, setFailed] = React.useState([]);
+    const [panelWidth, setPanelWidth] = React.useState(RN.Dimensions.get("window").width);
     const mounted = React.useRef(true);
-    React.useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
-    function change(key, val) { storage[key] = val; setRefresh(n => n + 1); }
-    return E(RN.ScrollView, { style: { flex: 1, backgroundColor: "#232428" },
-      contentContainerStyle: { padding: 16, paddingBottom: 50 } },
-      heading("BetterMediaPicker · prototype " + VERSION),
-      txt("Status: " + runtime, { color: "#b6bbc6", marginBottom: 10 }),
-      txt("Replaces Discord's Attach File action with an in-Discord gallery when the CameraRoll bridge and custom alert are available. If unavailable, normal Discord behavior remains.",
-        { color: "#b6bbc6", marginBottom: 10 }),
-      heading("Photos tray investigation"),
-      txt("This update diagnoses the built-in + → Photos tray. It does not resize or sort that tray yet. Open it once before scanning. The controls below apply only to the older experimental Files gallery.", { color: "#ffdb99", marginBottom: 10 }),
-      button(busy ? "Scanning…" : "Scan loaded modules", async () => {
-        if (busy) return;
-        setBusy(true);
-        try { const result = await scanLoadedModules(); if (mounted.current) setReport(fullDiagnosticReport()); }
-        finally { if (mounted.current) setBusy(false); }
-      }, false),
-      button("Start Photos API capture (60 seconds)", () => {
-        observePhotosAPI(); setReport(fullDiagnosticReport());
-      }, false),
-      button("Refresh captured report", () => setReport(fullDiagnosticReport()), false),
-      txt("After starting capture, open + → Photos and scroll. Return here, refresh, then copy. Only argument/response field types and array lengths are recorded; photo values are omitted.", { color: "#b6bbc6", fontSize: 12, marginVertical: 8 }),
-      button("Copy diagnostic report", () => {
-        try {
-          const clipboard = metro.common.clipboard;
-          if (!clipboard || typeof clipboard.setString !== "function") throw new Error();
-          clipboard.setString(fullDiagnosticReport());
-          setCopyStatus("Copied. Paste the report into this ChatGPT conversation.");
-        } catch (_) { setCopyStatus("Copy unavailable. Select the report text or take screenshots."); }
-      }, false),
-      txt(copyStatus, { color: "#b6bbc6", marginVertical: 5 }),
-      E(RN.Text, { selectable: true, style: { color: "#d3d6df", fontSize: 12, marginVertical: 10 } }, report),
-      heading("Experimental Files gallery"),
-      button(storage.enabled ? "Enabled (tap to disable)" : "Disabled (tap to enable)",
-        () => change("enabled", !storage.enabled), !!storage.enabled),
-      heading("Photo columns"),
-      E(RN.View, { style: { flexDirection: "row", flexWrap: "wrap" } },
-        COLS.map(c => E(React.Fragment, { key: c }, button(String(c), () => change("columns", c), storage.columns === c)))),
-      heading("Sort currently loaded photos"),
-      E(RN.View, { style: { flexDirection: "row", flexWrap: "wrap" } },
-        SORTS.map(s => E(React.Fragment, { key: s }, button(s, () => change("sort", s), storage.sort === s)))),
-      heading("Selection behavior"),
-      button(storage.instant ? "Single-tap attachment (fastest)" : "Multi-select then Attach",
-        () => change("instant", !storage.instant), true),
-      txt("Sorting affects fetched photos only (initially up to 120, then Load more). Oldest and filename do not query your entire library. Only photos are supported in v0.1.0.",
-        { color: "#b6bbc6", marginTop: 15, fontSize: 12 }),
-      heading("Diagnostics"),
-      txt(`Media bridge: ${getCameraRoll() ? "Found" : "Not found"}`),
-      txt(`Native fallback picker: ${getNativePicker() ? "Found" : "Not found"}`),
-      txt(`Discord attach hook: ${getTarget() ? "Found" : "Not found"}`),
-      txt(`Sheet UI: ${typeof vendetta.ui.alerts.showCustomAlert === "function" ? "Found" : "Not found"}`)
+    const locked = React.useRef(false);
+    const close = () => { setVisible(false); pickerOpen = false; closeAlert(); };
+    React.useEffect(() => {
+      mounted.current = true; openViews.add(close);
+      return () => { mounted.current = false; openViews.delete(close); pickerOpen = false; };
+    }, []);
+    function refresh() { if (mounted.current) setItems(collection()); }
+    async function importMore() {
+      if (locked.current) return;
+      locked.current = true; setBusy(true); setNotice("Choose photos in Android's picker. Selected photos will be copied into Kettu when supported.");
+      try {
+        const result = await addPhotos(count => { if (mounted.current) { refresh(); setNotice(`Adding photos… ${count}`); } });
+        if (mounted.current) { refresh(); setNotice(result.message); }
+      } finally { locked.current = false; if (mounted.current) setBusy(false); }
+    }
+    async function attach(batch) {
+      if (locked.current || !batch.length) return;
+      locked.current = true; setBusy(true);
+      try { await attachPhotos(batch, channelId); close(); }
+      catch (error) { if (mounted.current) setNotice(error.message); }
+      finally { locked.current = false; if (mounted.current) setBusy(false); }
+    }
+    function select(item) {
+      if (busy || managing) return;
+      if (failed.includes(item.id)) { setNotice("This preview failed. Remove this photo and add it again."); return; }
+      if (instant) return attach([item]);
+      setSelection(ids => ids.includes(item.id) ? ids.filter(id => id !== item.id)
+        : ids.length < MAX_BATCH ? [...ids, item.id] : ids);
+    }
+    const filtered = ordered(items.filter(item => (!favorites || item.favorite) &&
+      item.filename.toLowerCase().includes(query.trim().toLowerCase())), sort);
+    const tile = Math.max(30, Math.floor((panelWidth - 24) / columns) - 4);
+    const content = E(RN.View, { onLayout: event => {
+      const width = event && event.nativeEvent && event.nativeEvent.layout.width;
+      if (width > 0) setPanelWidth(width);
+    }, style: { flex: 1, backgroundColor: "#202127", paddingHorizontal: 12, paddingTop: 14, paddingBottom: 18 } },
+      row(txt("Quick Photos", { flex: 1, fontSize: 23, fontWeight: "800" }), button("Close", close, false, busy)),
+      txt(`${items.length} photos · ${items.filter(p => p.favorite).length} favorites`, { color: "#a8abb5", marginVertical: 5 }),
+      row(button("Add photos", importMore, true, busy),
+        button(`${columns} columns`, () => { const c = COLS[(COLS.indexOf(columns) + 1) % COLS.length]; storage.columns = c; setColumns(c); }, false, busy),
+        button(SORT_LABELS[sort], () => { const v = SORTS[(SORTS.indexOf(sort) + 1) % SORTS.length]; storage.sort = v; setSort(v); }, false, busy)),
+      row(button(favorites ? "Favorites only" : "All photos", () => setFavorites(v => !v), favorites, busy),
+        button(instant ? "Tap to attach" : "Multi-select", () => { storage.instant = !instant; setInstant(v => !v); setSelection([]); }, instant, busy),
+        button(managing ? "Done managing" : "Manage", () => { setManaging(v => !v); setSelection([]); }, managing, busy)),
+      E(RN.TextInput, { value: query, onChangeText: setQuery, placeholder: "Search added photos by filename", placeholderTextColor: "#969baa",
+        accessibilityLabel: "Search added photos", editable: !busy, style: { color: "#f2f3f5", backgroundColor: "#303239", borderRadius: 10, padding: 10, marginVertical: 8 } }),
+      notice ? txt(notice, { color: "#ffdb99", fontSize: 12, marginBottom: 6 }) : null,
+      txt(managing ? "Remove only deletes the Quick Photos copy; your original stays in your gallery." : "Tap ★ or hold a photo to favorite it. Photos attach to the composer for you to review.", { color: "#a8abb5", fontSize: 11, marginBottom: 8 }),
+      E(RN.FlatList, { key: `quick-grid-${columns}`, data: filtered, numColumns: columns, keyExtractor: item => item.id,
+        style: { flex: 1 }, initialNumToRender: columns * 6, windowSize: 5, extraData: [selection, managing, failed],
+        renderItem: ({ item }) => E(RN.View, { style: { width: tile, margin: 2 } },
+          E(RN.TouchableOpacity, { onPress: () => select(item), onLongPress: () => { if (!busy) { setFavorite(item.id); refresh(); } },
+            disabled: busy || managing, accessibilityRole: "button", accessibilityLabel: item.filename,
+            style: { width: tile, height: tile, borderRadius: 8, overflow: "hidden", borderWidth: selection.includes(item.id) ? 3 : 0,
+              borderColor: "#5865f2", backgroundColor: "#36393f" } },
+            failed.includes(item.id) ? txt("Unavailable\nRe-add photo", { textAlign: "center", marginTop: 12, fontSize: 11 }) :
+              E(RN.Image, { source: { uri: item.uri }, resizeMode: "cover", onError: () => setFailed(ids => ids.includes(item.id) ? ids : [...ids, item.id]),
+                style: { width: "100%", height: "100%" } }),
+            selection.includes(item.id) ? E(RN.View, { style: { position: "absolute", left: 3, top: 3, backgroundColor: "#5865f2", padding: 3, borderRadius: 5 } }, txt("✓")) : null),
+          E(RN.TouchableOpacity, { accessibilityRole: "button", accessibilityLabel: item.favorite ? "Remove favorite" : "Favorite photo",
+            disabled: busy, onPress: () => { setFavorite(item.id); refresh(); },
+            style: { position: "absolute", top: 2, right: 2, borderRadius: 9, backgroundColor: "#202127dd", padding: 5 } }, txt(item.favorite ? "★" : "☆", { color: "#ffdb78", fontSize: 19 })),
+          managing ? button("Remove", async () => {
+            if (locked.current) return;
+            locked.current = true; setBusy(true);
+            try { await removePhoto(item.id); refresh(); }
+            finally { locked.current = false; if (mounted.current) setBusy(false); }
+          }, false, busy) : null,
+          txt(item.managedPath ? "Saved" : "Temporary", { color: "#a8abb5", fontSize: 10, paddingVertical: 3 })),
+        ListEmptyComponent: E(RN.View, { style: { padding: 22 } },
+          txt(items.length ? "No matching photos." : "Build your Quick Photos collection", { textAlign: "center", fontWeight: "700", marginBottom: 10 }),
+          txt(items.length ? "Change the search or favorites filter." : "Tap Add photos and choose a batch. They’ll appear here for quick reuse. This collection contains only photos you add.", { textAlign: "center", color: "#a8abb5" })) }),
+      !instant && !managing ? button(`Attach ${selection.length} / ${MAX_BATCH}`, () => attach(items.filter(item => selection.includes(item.id))), true, busy || !selection.length) : null
+    );
+    return E(RN.Modal, { visible, animationType: "slide", presentationStyle: "fullScreen", onRequestClose: () => { if (!locked.current) close(); } },
+      E(RN.SafeAreaView || RN.View, { style: { flex: 1, backgroundColor: "#202127" } }, content));
+  }
+  function openPicker(channelId) {
+    if (!running || !storage.enabled) { tell("Enable Quick Photos in plugin settings first."); return; }
+    if (pickerOpen) return;
+    const alerts = vendetta.ui && vendetta.ui.alerts;
+    if (!alerts || typeof alerts.showCustomAlert !== "function" || !RN.Modal) throw new Error("Custom picker UI unavailable.");
+    if (!channelId) throw new Error("Open a chat before opening Quick Photos.");
+    pickerOpen = true;
+    try {
+      const result = alerts.showCustomAlert(Picker, { channelId });
+      if (result && typeof result.catch === "function") result.catch(() => { pickerOpen = false; tell("Quick Photos could not open on this build."); });
+    } catch (error) { pickerOpen = false; throw error; }
+  }
+  function Settings() {
+    const [, update] = React.useState(0);
+    const [notice, setNotice] = React.useState("");
+    const refresh = () => update(v => v + 1);
+    return E(RN.ScrollView, { style: { flex: 1, backgroundColor: "#202127" }, contentContainerStyle: { padding: 16, paddingBottom: 48 } },
+      heading("BetterMediaPicker · " + VERSION),
+      txt(runtime, { color: "#a8abb5", marginBottom: 8 }),
+      txt("A custom collection for fast photo reuse. Add photos once through Android's picker, then attach them from your own grid. The built-in Photos tray is unchanged."),
+      row(button(storage.enabled ? "Enabled" : "Disabled", () => { storage.enabled = !storage.enabled; refresh(); }, storage.enabled),
+        button("Open Quick Photos", () => { try { openPicker(currentChannel()); } catch (e) { setNotice(e.message); } }, true)),
+      heading("How to open"),
+      txt("In a chat: + → Files opens Quick Photos when the attachment hook is available. You can also run /quickphotos. Neither action sends a message."),
+      heading("Your collection"),
+      txt(`${storage.quickPhotos.length} saved · ${temporaryPhotos.length} temporary`),
+      txt("When Kettu's file interface supports it, imports create private copies inside the app. Copies use device storage. Photos that cannot be copied are marked Temporary and must be re-added after reload or cache expiry.", { color: "#a8abb5", marginTop: 8 }),
+      heading("Default columns"),
+      row(...COLS.map(n => button(String(n), () => { storage.columns = n; refresh(); }, storage.columns === n))),
+      heading("Default sort"),
+      row(...SORTS.map(mode => button(SORT_LABELS[mode], () => { storage.sort = mode; refresh(); }, storage.sort === mode))),
+      txt("Dates refer to when you added photos to Quick Photos, not when the original photos were taken.", { color: "#a8abb5", fontSize: 12, marginTop: 6 }),
+      heading("Selection"),
+      button(storage.instant ? "Single tap attaches" : "Multi-select, then Attach", () => { storage.instant = !storage.instant; refresh(); }, storage.instant),
+      txt("Up to 10 photos per attachment batch. You review the message and press Send yourself. Manage → Remove deletes only this plugin's saved copy/reference."),
+      notice || lastNotice ? txt(notice || lastNotice, { color: "#ffdb99", marginVertical: 12 }) : null
     );
   }
-
   return {
     onLoad() {
-      initializeDefaults();
-      const target = getTarget();
-      const api = getCameraRoll();
-      const alertFn = vendetta.ui && vendetta.ui.alerts && vendetta.ui.alerts.showCustomAlert;
-      if (!target || typeof target.handleAttachFile !== "function") {
-        runtime = "Attachment hook missing (no modification applied)"; notify(runtime); return;
+      defaults(); running = true; generation++;
+      let hooked = false, command = false;
+      const api = target();
+      if (api && typeof api.handleAttachFile === "function") {
+        try {
+          cleanups.push(vendetta.patcher.instead("handleAttachFile", api, (args, original) => {
+            if (!storage.enabled) return original(...args);
+            try { openPicker(currentChannel()); }
+            catch (_) { tell("Quick Photos could not open; using the normal attachment picker."); return original(...args); }
+          }));
+          hooked = true;
+        } catch (_) {}
       }
-      if (!api || typeof api.getPhotos !== "function" || typeof alertFn !== "function") {
-        runtime = "Custom gallery bridge missing (normal Discord picker preserved)"; notify(runtime); return;
+      if (vendetta.commands && typeof vendetta.commands.registerCommand === "function") {
+        try {
+          const unregister = vendetta.commands.registerCommand({ name: "quickphotos", description: "Open your Quick Photos collection without sending a message", options: [],
+            execute(_args, ctx) { try { openPicker(ctx && ctx.channel && ctx.channel.id); } catch (e) { tell(e.message); } } });
+          if (typeof unregister === "function") cleanups.push(unregister);
+          command = true;
+        } catch (_) {}
       }
-      try {
-        const unpatch = vendetta.patcher.instead("handleAttachFile", target, (args, original) => {
-          if (!storage.enabled) return original(...args);
-          try { return alertFn(Picker, {}); }
-          catch (err) { notify(`Opening custom picker failed: ${String(err)}`); return original(...args); }
-        });
-        unpatches.push(unpatch);
-        active = true;
-        runtime = "Hook installed. Open + → Attach File to test.";
-        notify(runtime);
-      } catch (e) {
-        runtime = "Patch failed: " + String(e);
-        notify(runtime);
-      }
+      runtime = `Quick Photos ${VERSION} · Files shortcut: ${hooked ? "ready" : "unavailable"} · /quickphotos: ${command ? "ready" : "unavailable"}`;
     },
     onUnload() {
-      observationGeneration++;
-      endObservation();
-      scanGeneration++;
-      scanning = false;
-      while (unpatches.length) { try { unpatches.pop()(); } catch (_) {} }
-      active = false;
-      runtime = "Unloaded";
+      running = false; generation++; importBusy = false;
+      for (const cancel of pendingPicks) cancel();
+      pendingPicks.clear();
+      for (const close of openViews) safe(close);
+      openViews.clear(); pickerOpen = false;
+      while (cleanups.length) safe(cleanups.pop());
+      temporaryPhotos = []; runtime = "Unloaded";
     },
     settings: Settings
   };

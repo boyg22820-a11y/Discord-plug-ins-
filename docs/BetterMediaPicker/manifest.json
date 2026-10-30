@@ -1,6 +1,6 @@
 {
   "name": "BetterMediaPicker Prototype",
-  "description": "Photos tray compatibility diagnostics plus the older experimental Files gallery. The built-in Photos tray is not modified yet.",
+  "description": "Quick Photos: a custom in-app collection with adjustable columns, favorites, filename search and one-tap attachment. Add photos through Android\u2019s picker; private copies are saved where supported.",
   "authors": [
     {
       "name": "ChatGPT prototype",
@@ -11,6 +11,6 @@
   "vendetta": {
     "icon": "ic_image"
   },
-  "version": "0.1.2",
-  "hash": "d5530f6cdd1fbb6d30f8b3ac324b37fce686ae7d3d3583eb05be8b7de998800d"
+  "version": "0.2.0",
+  "hash": "0290fa0f03d2773301031b10b9648258eb99daae157b9c2e160a8abbf150b4f0"
 }
