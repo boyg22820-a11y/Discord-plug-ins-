@@ -1,4 +1,15 @@
-# BetterMediaPicker (Kettu prototype v0.1.1)
+# BetterMediaPicker (Kettu prototype v0.1.2)
+
+## v0.1.2: Targeted Photos API capture
+
+The user's 0.1.1 report identified `getDeviceMediaPhotos` on Kettu v1.4.3 / Discord 351.11 / React Native 0.86.0. Its calling contract and output are still unverified. This update can observe up to three real calls during a 60-second window. It does not invoke that API itself or change the Photos tray.
+
+1. Update and reload, then confirm **0.1.2** in plugin settings.
+2. Tap **Start Photos API capture (60 seconds)**.
+3. Immediately open a chat, tap **+ → Photos**, and scroll to load more images.
+4. Return to settings, tap **Refresh captured report**, then **Copy diagnostic report**, and paste into this ChatGPT conversation.
+
+Capture preserves the original arguments, returned value/promise and thrown errors. Reports include only allowlisted field names, types and array lengths, with no scalar data values. Captures stay in memory, stop after 60 seconds, and are detached on unload. An unpatchable export or cached tray may produce no call; that is reported explicitly.
 
 ## v0.1.1: Photos tray diagnostics
 

@@ -27,7 +27,7 @@ function makeTest(cameraAvailable=true, attachAvailable=true) {
     ui:{alerts:{showCustomAlert:(component)=>({component})}},
     patcher:{ instead:(name,obj,cb)=>{assert.equal(name,'handleAttachFile');assert.equal(obj,target); patched=cb; return ()=>{restored=true;};} }
   };
-  const plugin=vm.runInNewContext(`(function(vendetta){return ${code}\n})`,{vendetta, console, setTimeout})(vendetta);
+  const plugin=vm.runInNewContext(`(function(vendetta){return ${code}\n})`,{vendetta, console, setTimeout, clearTimeout})(vendetta);
   return {plugin,vendetta,get patched(){return patched},get restored(){return restored},attachments,target};
 }
 assert.equal(manifest.main,'index.js');
@@ -102,3 +102,33 @@ const pending=buttons(tree).find(b=>b.children[0].children[0]==='Scan loaded mod
 s.plugin.onUnload();await pending;
 assert.equal(s.vendetta.plugin.storage.columns,6);
 console.log('PASS: diagnostics UI, metadata-only report, skipped getters, lazy module refresh, clipboard, unload cancellation.');
+
+// Targeted capture must preserve real API calls and redact every data value.
+s=makeTest(false);copied='';getterCalls=0;
+s.vendetta.metro.common.clipboard={setString:value=>{copied=value;}};
+const apiPromise=Promise.resolve({edges:[{node:{image:{uri:'file:///PRIVATE_URI',filename:'PRIVATE_NAME.jpg',width:400},timestamp:123}}],page_info:{has_next_page:true,end_cursor:'PRIVATE_CURSOR'}});
+const callArgs=[{first:120,after:'PRIVATE_CURSOR',include:['filename']}];
+let invoked=0;
+const photoAPI={getDeviceMediaPhotos(...args){invoked++;assert.equal(args[0],callArgs[0]);return apiPromise;}};
+s.vendetta.metro.modules={10334:{isInitialized:true,publicModule:{exports:photoAPI}}};
+let undone=0;
+s.vendetta.patcher.instead=(name,owner,callback)=>{
+ assert.equal(name,'getDeviceMediaPhotos');
+ const original=owner[name];
+ owner[name]=(...args)=>callback(args,original.bind(owner));
+ return ()=>{owner[name]=original;undone++;};
+};
+s.plugin.onLoad();
+let captureButtons=buttons(s.plugin.settings());
+captureButtons.find(b=>b.children[0].children[0]==='Start Photos API capture (60 seconds)').props.onPress();
+assert.equal(invoked,0,'starting capture must not invoke the photo API');
+assert.equal(photoAPI.getDeviceMediaPhotos(...callArgs),apiPromise,'promise identity must be preserved');
+await apiPromise;await new Promise(resolve=>setImmediate(resolve));
+buttons(s.plugin.settings()).find(b=>b.children[0].children[0]==='Copy diagnostic report').props.onPress();
+assert.match(copied,/Resolved shape:/);
+assert.match(copied,/"uri":"string"/);
+assert.match(copied,/"first":"number"/);
+assert.doesNotMatch(copied,/PRIVATE_|file:\/\//);
+s.plugin.onUnload();assert.equal(undone,1);
+assert.equal(invoked,1);
+console.log('PASS: API capture preserves arguments and promise identity, redacts values, never calls API itself, and restores hook.');

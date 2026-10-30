@@ -1,6 +1,6 @@
 (() => {
   "use strict";
-  const VERSION = "0.1.1";
+  const VERSION = "0.1.2";
   const COLS = [3, 4, 5, 6];
   const SORTS = ["newest", "oldest", "filename"];
   const unpatches = [];
@@ -299,9 +299,107 @@
     return diagnosticReport;
   }
 
+
+  // Observe real tray calls instead of guessing this private API's signature.
+  let stopObservation = null;
+  let observationTimer = null;
+  let observationGeneration = 0;
+  let observationStatus = "Not started";
+  let observationLines = [];
+  const schemaKeys = new Set(("first limit offset after before cursor assetType mediaType include sort sortBy sortOrder order ascending descending groupName album albumId groupTypes mimeTypes fromTime toTime " +
+    "edges node image photos assets media items data results result page page_info pageInfo has_next_page hasNextPage end_cursor endCursor nextCursor next hasMore total count " +
+    "uri url path filename fileName name id identifier type mimeType timestamp creationTime modificationTime modificationTimestamp width height duration playableDuration size fileSize " +
+    "location latitude longitude albums imageSize start end success error code").split(/\s+/));
+  function shape(value, depth = 0) {
+    if (value === null) return "null";
+    if (depth > 4) return Array.isArray(value) ? "array" : typeof value;
+    if (Array.isArray(value)) {
+      // Length and the first element's field types only; no values.
+      return { kind: "array", length: value.length, sample: value.length ? shape(ownValue(value, "0"), depth + 1) : null };
+    }
+    if (typeof value === "object") {
+      const result = {};
+      const names = ownNames(value);
+      let unknown = 0;
+      for (const name of names) {
+        if (!schemaKeys.has(name)) { unknown++; continue; }
+        const desc = Object.getOwnPropertyDescriptor(value, name);
+        result[name] = desc && "value" in desc ? shape(desc.value, depth + 1) : "accessor (not read)";
+      }
+      if (unknown) result.otherFieldCount = unknown;
+      return result;
+    }
+    return typeof value;
+  }
+  function fullDiagnosticReport() {
+    return diagnosticReport + "\n\nPhotos API observation: " + observationStatus +
+      (observationLines.length ? "\n" + observationLines.join("\n") : "");
+  }
+  function endObservation() {
+    if (observationTimer !== null) { clearTimeout(observationTimer); observationTimer = null; }
+    if (stopObservation) { const undo = stopObservation; stopObservation = null; try { undo(); } catch (_) {} }
+  }
+  function observePhotosAPI() {
+    endObservation();
+    const generation = ++observationGeneration;
+    observationLines = [];
+    let owner = null;
+    const modules = metro.modules;
+    for (const id of Object.keys(modules || {})) {
+      if (!/^\d+$/.test(id)) continue;
+      const record = ownValue(modules, id);
+      if (ownValue(record, "isInitialized") !== true || ownValue(record, "hasError")) continue;
+      const exp = ownValue(ownValue(record, "publicModule"), "exports");
+      for (const candidate of [exp, ownValue(exp, "default")]) {
+        if (!candidate || !Object.prototype.hasOwnProperty.call(candidate, "getDeviceMediaPhotos")) continue;
+        // Read this single identified export; don't invoke the photo function.
+        const fn = safeFind(() => candidate.getDeviceMediaPhotos);
+        if (typeof fn === "function") { owner = candidate; break; }
+      }
+      if (owner) break;
+    }
+    if (!owner) { observationStatus = "getDeviceMediaPhotos not loaded. Open Photos once, then try again."; return; }
+    observationLines.push("getDeviceMediaPhotos declared arguments: " + owner.getDeviceMediaPhotos.length);
+    try {
+      let calls = 0;
+      stopObservation = vendetta.patcher.instead("getDeviceMediaPhotos", owner, (args, original) => {
+        const record = generation === observationGeneration && calls++ < 3;
+        if (record) {
+          observationStatus = "Observed real Photos API call";
+          try { observationLines.push("Arguments: " + JSON.stringify(args.map(arg => shape(arg)))); } catch (_) {}
+        }
+        let result;
+        try { result = original(...args); }
+        catch (error) {
+          if (record) observationLines.push("Original API threw (error contents omitted)");
+          throw error;
+        }
+        if (record) {
+          try {
+            if (result && typeof result.then === "function") {
+              observationLines.push("Returns a promise");
+              Promise.resolve(result).then(value => {
+                if (generation === observationGeneration) {
+                  try { observationLines.push("Resolved shape: " + JSON.stringify(shape(value))); } catch (_) {}
+                }
+              }, () => { if (generation === observationGeneration) observationLines.push("Promise rejected (error contents omitted)"); });
+            } else observationLines.push("Returned shape: " + JSON.stringify(shape(result)));
+          } catch (_) {}
+        }
+        return result;
+      });
+      observationStatus = "Listening for 60 seconds. Open + → Photos, scroll, then return here.";
+      observationTimer = setTimeout(() => {
+        if (generation !== observationGeneration) return;
+        endObservation();
+        observationStatus = calls ? "Capture finished" : "No call observed. The tray may have reused cached photos or another API.";
+      }, 60000);
+    } catch (_) { observationStatus = "Export could not be observed on this build. No photo API was invoked."; }
+  }
+
   function Settings() {
     const [refresh, setRefresh] = React.useState(0);
-    const [report, setReport] = React.useState(diagnosticReport);
+    const [report, setReport] = React.useState(fullDiagnosticReport());
     const [busy, setBusy] = React.useState(false);
     const [copyStatus, setCopyStatus] = React.useState("");
     const mounted = React.useRef(true);
@@ -318,14 +416,19 @@
       button(busy ? "Scanning…" : "Scan loaded modules", async () => {
         if (busy) return;
         setBusy(true);
-        try { const result = await scanLoadedModules(); if (mounted.current) setReport(result); }
+        try { const result = await scanLoadedModules(); if (mounted.current) setReport(fullDiagnosticReport()); }
         finally { if (mounted.current) setBusy(false); }
       }, false),
+      button("Start Photos API capture (60 seconds)", () => {
+        observePhotosAPI(); setReport(fullDiagnosticReport());
+      }, false),
+      button("Refresh captured report", () => setReport(fullDiagnosticReport()), false),
+      txt("After starting capture, open + → Photos and scroll. Return here, refresh, then copy. Only argument/response field types and array lengths are recorded; photo values are omitted.", { color: "#b6bbc6", fontSize: 12, marginVertical: 8 }),
       button("Copy diagnostic report", () => {
         try {
           const clipboard = metro.common.clipboard;
           if (!clipboard || typeof clipboard.setString !== "function") throw new Error();
-          clipboard.setString(report);
+          clipboard.setString(fullDiagnosticReport());
           setCopyStatus("Copied. Paste the report into this ChatGPT conversation.");
         } catch (_) { setCopyStatus("Copy unavailable. Select the report text or take screenshots."); }
       }, false),
@@ -381,6 +484,8 @@
       }
     },
     onUnload() {
+      observationGeneration++;
+      endObservation();
       scanGeneration++;
       scanning = false;
       while (unpatches.length) { try { unpatches.pop()(); } catch (_) {} }
